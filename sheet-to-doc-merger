@@ -1,0 +1,593 @@
+/**
+ * Sheet-to-Doc Merge Creator
+ * 100% AI-generated, 100% human-directed.
+ * Directed and iterated by Yordhan Fitrians Akhmad B. based on real HR pain points —
+ * refined repeatedly for business fit, user experience, and workflow comfort.
+ * Published as a generic, reusable template. Configure everything via the ⚙️ Setup menu.
+ */
+
+/*******************************************************************************
+ * SHEET-TO-DOC MERGE CREATOR (Autocrat-style mail merge, public template)
+ *
+ * WHAT IT DOES
+ *  1. Reads rows from a Google Sheet.
+ *  2. When the trigger column (e.g. "Create Document?") is set to YES and the
+ *     row has not been merged yet, it copies a Google Doc template, replaces
+ *     every <<placeholder>> with the matching column value, and exports a PDF.
+ *  3. Writes the merge results back to four output columns
+ *     (Merged Doc ID / Merged Doc URL / Link to merged Doc / Merge Status).
+ *
+ * PLACEHOLDER RESOLUTION
+ *  <<Tags>> in the Doc template are matched to SHEET HEADER NAMES
+ *  (exact → prefix → contains, case-insensitive, whitespace-normalized),
+ *  so inserting/removing columns is safe. Optional aliases map short tags
+ *  (e.g. <<Name>>) to longer headers (e.g. "Candidate Name").
+ *
+ * ZERO HARDCODED IDS
+ *  All IDs, sheet names, and column headers are entered once through the
+ *  ⚙️ Setup menu and stored in Script Properties (PropertiesService).
+ *  Nothing sensitive lives in this file.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * EXAMPLE SHEET SCHEMA — DEMONSTRATION ONLY, NOT PRODUCTION.
+ * The real header mapping must be supplied by whoever adapts this template.
+ * Row 1 (headers), data from row 2:
+ *
+ *   | Timestamp | Candidate Name | Role              | Score | Assessment Summary |
+ *   | 01/01/25  | Jane Example   | General Executive | 85    | Meets expectations |
+ *
+ *   ...plus the control columns (anywhere in the sheet):
+ *   | Create Document? | Merged Doc ID | Merged Doc URL | Link to merged Doc | Document Merge Status |
+ *
+ * A matching Doc template would contain e.g.:
+ *   "Candidate: <<Candidate Name>> — Role: <<Role>> — Score: <<Score>>"
+ * ─────────────────────────────────────────────────────────────────────────────
+ ******************************************************************************/
+
+
+// ═══════════════════════ CONFIG LAYER (Script Properties) ═══════════════════════
+// No real IDs or names below — these are neutral defaults a new user overrides
+// via the ⚙️ Setup menu. Values are stored with PropertiesService.
+
+const CONFIG_KEYS = {
+  TEMPLATE_DOC_ID:  'MERGE_TEMPLATE_DOC_ID',
+  OUTPUT_FOLDER_ID: 'MERGE_OUTPUT_FOLDER_ID',
+  SHEET_NAME:       'MERGE_SHEET_NAME',
+  HEADER_ROW:       'MERGE_HEADER_ROW',
+  COL_TRIGGER:      'MERGE_COL_TRIGGER',
+  COL_DOC_ID:       'MERGE_COL_DOC_ID',
+  COL_DOC_URL:      'MERGE_COL_DOC_URL',
+  COL_LINK:         'MERGE_COL_LINK',
+  COL_STATUS:       'MERGE_COL_STATUS',
+  COL_NAME:         'MERGE_COL_NAME',
+  FILE_NAME_PATTERN:'MERGE_FILE_NAME_PATTERN',
+  ALIASES_JSON:     'MERGE_ALIASES_JSON',
+};
+
+const CONFIG_DEFAULTS = {
+  TEMPLATE_DOC_ID:  '',                       // required — set via ⚙️ Setup
+  OUTPUT_FOLDER_ID: '',                       // empty = same folder as template
+  SHEET_NAME:       'Sheet1',
+  HEADER_ROW:       '1',
+  COL_TRIGGER:      'Create Document?',
+  COL_DOC_ID:       'Merged Doc ID',
+  COL_DOC_URL:      'Merged Doc URL',
+  COL_LINK:         'Link to merged Doc',
+  COL_STATUS:       'Document Merge Status',
+  COL_NAME:         'Candidate Name',         // used for confirmation dialogs & file names
+  FILE_NAME_PATTERN:'Merged Document - <<Candidate Name>> - <<Timestamp>>',
+  // Short-tag aliases → header names. JSON string. Demonstration values only.
+  ALIASES_JSON:     '{"name":"Candidate Name"}',
+};
+
+/** Read full config: Script Properties merged over defaults. */
+function getConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const cfg = {};
+  Object.keys(CONFIG_KEYS).forEach(k => {
+    cfg[k] = props.getProperty(CONFIG_KEYS[k]) || CONFIG_DEFAULTS[k];
+  });
+  cfg.HEADER_ROW = parseInt(cfg.HEADER_ROW, 10) || 1;
+  try { cfg.ALIASES = JSON.parse(cfg.ALIASES_JSON); } catch (e) { cfg.ALIASES = {}; }
+  return cfg;
+}
+
+/** Write one config value to Script Properties. */
+function saveConfig_(key, value) {
+  PropertiesService.getScriptProperties().setProperty(CONFIG_KEYS[key], String(value));
+}
+
+
+// ─────────────────────────── MENU ───────────────────────────
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('📄 Merge Creator')
+    .addItem('▶️ Generate all YES rows (not yet merged)', 'generateAllPending')
+    .addItem('🔁 Force re-generate selected row', 'forceRegenerateSelectedRow')
+    .addSeparator()
+    .addItem('⚡ Install auto-trigger (merge when trigger column = YES)', 'installOnEditTrigger')
+    .addItem('🧹 Uninstall auto-trigger', 'uninstallOnEditTrigger')
+    .addToUi();
+
+  SpreadsheetApp.getUi()
+    .createMenu('⚙️ Setup')
+    .addItem('🚀 Run setup wizard (all settings)', 'runSetupWizard')
+    .addSeparator()
+    .addItem('📄 Set template Doc', 'setTemplateViaMenu')
+    .addItem('📁 Set output folder', 'setFolderViaMenu')
+    .addItem('📊 Set sheet name & header row', 'setSheetViaMenu')
+    .addItem('🏷️ Set column headers', 'setColumnsViaMenu')
+    .addItem('🔤 Set placeholder aliases (JSON)', 'setAliasesViaMenu')
+    .addItem('ℹ️ View current config', 'showActiveConfig')
+    .addToUi();
+}
+
+
+// ─────────────────────── SETUP MENU ACTIONS ───────────────────────
+function runSetupWizard() {
+  setTemplateViaMenu();
+  setFolderViaMenu();
+  setSheetViaMenu();
+  setColumnsViaMenu();
+  showActiveConfig();
+}
+
+function setTemplateViaMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+
+  let currentInfo = '(not set)';
+  if (cfg.TEMPLATE_DOC_ID) {
+    try {
+      const f = DriveApp.getFileById(cfg.TEMPLATE_DOC_ID);
+      currentInfo = f.getName() + '\nhttps://docs.google.com/document/d/' + cfg.TEMPLATE_DOC_ID + '/edit';
+    } catch (e) { currentInfo = '(saved but not accessible)'; }
+  }
+
+  const resp = ui.prompt(
+    '📄 Set Template Doc',
+    'Current ACTIVE template:\n' + currentInfo + '\n\n' +
+    'Paste the link of the NEW Google Doc template below.\n' +
+    '(Leave empty & click OK to only view, without changing.)',
+    ui.ButtonSet.OK_CANCEL);
+
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  const input = resp.getResponseText().trim();
+  if (!input) return;
+
+  const newId = extractDriveId_(input);
+  if (!newId) { ui.alert('Invalid link. Make sure it is a Google Doc link.'); return; }
+
+  let newName;
+  try {
+    newName = DocumentApp.openById(newId).getName();
+  } catch (e) {
+    ui.alert('Could not open that file as a Google Doc.\nCheck access/link.\n\nError: ' + e.message);
+    return;
+  }
+
+  const confirm = ui.alert(
+    'Confirm template change',
+    'The merge template will be changed to:\n\n"' + newName + '"\n' +
+    'https://docs.google.com/document/d/' + newId + '/edit\n\n' +
+    'All merges AFTER this will use that template. Proceed?',
+    ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) { ui.alert('Cancelled. Template unchanged.'); return; }
+
+  saveConfig_('TEMPLATE_DOC_ID', newId);
+  ui.alert('✅ Template changed to: "' + newName + '"');
+}
+
+function setFolderViaMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+
+  let currentInfo = '(default: same folder as the template)';
+  if (cfg.OUTPUT_FOLDER_ID) {
+    try {
+      const f = DriveApp.getFolderById(cfg.OUTPUT_FOLDER_ID);
+      currentInfo = f.getName() + '\nhttps://drive.google.com/drive/folders/' + cfg.OUTPUT_FOLDER_ID;
+    } catch (e) { currentInfo = '(saved but not accessible)'; }
+  }
+
+  const resp = ui.prompt(
+    '📁 Set Output Folder',
+    'Current ACTIVE output folder:\n' + currentInfo + '\n\n' +
+    'Paste the link of the NEW Google Drive folder below.\n' +
+    'Type RESET to return to the default (template folder).\n' +
+    '(Leave empty & click OK to only view.)',
+    ui.ButtonSet.OK_CANCEL);
+
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  const input = resp.getResponseText().trim();
+  if (!input) return;
+
+  if (input.toUpperCase() === 'RESET') {
+    const confirmReset = ui.alert('Confirm', 'Reset output folder to default (same folder as template)?', ui.ButtonSet.YES_NO);
+    if (confirmReset === ui.Button.YES) {
+      PropertiesService.getScriptProperties().deleteProperty(CONFIG_KEYS.OUTPUT_FOLDER_ID);
+      ui.alert('✅ Output folder reset to default.');
+    }
+    return;
+  }
+
+  const newId = extractDriveId_(input);
+  if (!newId) { ui.alert('Invalid link. Make sure it is a Drive folder link.'); return; }
+
+  let newName;
+  try {
+    newName = DriveApp.getFolderById(newId).getName();
+  } catch (e) {
+    ui.alert('Could not open that folder.\nCheck access/link.\n\nError: ' + e.message);
+    return;
+  }
+
+  const confirm = ui.alert(
+    'Confirm output folder change',
+    'All merge output (Doc + PDF) AFTER this will be saved to:\n\n"' + newName + '"\n' +
+    'https://drive.google.com/drive/folders/' + newId + '\n\nProceed?',
+    ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) { ui.alert('Cancelled. Folder unchanged.'); return; }
+
+  saveConfig_('OUTPUT_FOLDER_ID', newId);
+  ui.alert('✅ Output folder changed to: "' + newName + '"');
+}
+
+function setSheetViaMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+
+  const s = ui.prompt('📊 Sheet name',
+    'Current: "' + cfg.SHEET_NAME + '"\n\nEnter the name of the sheet (tab) containing your data.\n(Leave empty to keep.)',
+    ui.ButtonSet.OK_CANCEL);
+  if (s.getSelectedButton() !== ui.Button.OK) return;
+  if (s.getResponseText().trim()) saveConfig_('SHEET_NAME', s.getResponseText().trim());
+
+  const h = ui.prompt('📊 Header row',
+    'Current: row ' + cfg.HEADER_ROW + '\n\nEnter the row number that contains your column headers.\n(Leave empty to keep.)',
+    ui.ButtonSet.OK_CANCEL);
+  if (h.getSelectedButton() !== ui.Button.OK) return;
+  const hv = parseInt(h.getResponseText().trim(), 10);
+  if (hv > 0) saveConfig_('HEADER_ROW', hv);
+}
+
+function setColumnsViaMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+  const fields = [
+    ['COL_TRIGGER', 'Trigger column header (set to YES to merge a row)', cfg.COL_TRIGGER],
+    ['COL_DOC_ID',  'Output column header: merged file ID',              cfg.COL_DOC_ID],
+    ['COL_DOC_URL', 'Output column header: merged file URL (PDF)',       cfg.COL_DOC_URL],
+    ['COL_LINK',    'Output column header: hyperlink to merged Doc',     cfg.COL_LINK],
+    ['COL_STATUS',  'Output column header: merge status',                cfg.COL_STATUS],
+    ['COL_NAME',    'Column header used as the display name in dialogs', cfg.COL_NAME],
+  ];
+  for (const [key, label, current] of fields) {
+    const r = ui.prompt('🏷️ ' + label, 'Current: "' + current + '"\n(Leave empty to keep.)', ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return;
+    if (r.getResponseText().trim()) saveConfig_(key, r.getResponseText().trim());
+  }
+}
+
+function setAliasesViaMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+  const r = ui.prompt('🔤 Placeholder aliases (JSON)',
+    'Maps short template tags to full header names.\n' +
+    'Current: ' + cfg.ALIASES_JSON + '\n\n' +
+    'Example: {"name":"Candidate Name","score":"Total Score"}\n(Leave empty to keep.)',
+    ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  const input = r.getResponseText().trim();
+  if (!input) return;
+  try {
+    JSON.parse(input);
+    saveConfig_('ALIASES_JSON', input);
+    ui.alert('✅ Aliases saved.');
+  } catch (e) {
+    ui.alert('Invalid JSON. Nothing changed.\n\nError: ' + e.message);
+  }
+}
+
+function showActiveConfig() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+
+  let tplInfo = '(not set — run ⚙️ Setup)';
+  if (cfg.TEMPLATE_DOC_ID) {
+    try { tplInfo = DriveApp.getFileById(cfg.TEMPLATE_DOC_ID).getName(); }
+    catch (e) { tplInfo = '(not accessible)'; }
+  }
+
+  let folderInfo = '(default: template folder)';
+  if (cfg.OUTPUT_FOLDER_ID) {
+    try { folderInfo = DriveApp.getFolderById(cfg.OUTPUT_FOLDER_ID).getName(); }
+    catch (e) { folderInfo = '(not accessible)'; }
+  }
+
+  ui.alert('ℹ️ Active Configuration',
+    '📄 Template: ' + tplInfo + '\n' +
+    '📁 Output folder: ' + folderInfo + '\n' +
+    '📊 Sheet: ' + cfg.SHEET_NAME + ' (headers on row ' + cfg.HEADER_ROW + ')\n' +
+    '🔘 Trigger: column "' + cfg.COL_TRIGGER + '" = YES\n' +
+    '🔤 Aliases: ' + cfg.ALIASES_JSON,
+    ui.ButtonSet.OK);
+}
+
+function extractDriveId_(input) {
+  // Accepts a Doc link, folder link, or raw ID
+  const m = input.match(/[-\w]{25,}/);
+  return m ? m[0] : null;
+}
+
+
+// ─────────────────────── ENTRY POINTS ───────────────────────
+function generateAllPending() {
+  const ui = SpreadsheetApp.getUi();
+  const ctx = buildContext_();
+
+  const pending = [];
+  for (let r = 0; r < ctx.data.length; r++) {
+    const trigger = String(ctx.data[r][ctx.col.trigger] || '').trim().toUpperCase();
+    const status  = String(ctx.data[r][ctx.col.status]  || '').trim();
+    if (trigger !== 'YES') continue;
+    if (status.startsWith('Document successfully')) continue;
+    pending.push({ r: r, rowIdx: ctx.cfg.HEADER_ROW + 1 + r, name: getDisplayName_(ctx, r) });
+  }
+
+  if (pending.length === 0) {
+    ui.alert('No rows to process.\n\nMake sure the "' + ctx.cfg.COL_TRIGGER + '" column is set to YES and the merge status is still empty.');
+    return;
+  }
+
+  // ★ CONFIRMATION: show the names before anything is created
+  const list = pending.map((p, i) => (i + 1) + '. ' + p.name + ' (row ' + p.rowIdx + ')').join('\n');
+  const confirm = ui.alert(
+    'Confirm — ' + pending.length + ' document(s) will be created',
+    'Documents will be generated for:\n\n' + list + '\n\nDoes this match your intent? Proceed?',
+    ui.ButtonSet.YES_NO);
+
+  if (confirm !== ui.Button.YES) {
+    SpreadsheetApp.getActiveSpreadsheet().toast('Cancelled. No documents were created.', 'Merge Creator', 5);
+    return;
+  }
+
+  let ok = 0, fail = 0;
+  pending.forEach(p => {
+    try {
+      mergeRow_(ctx, p.r, p.rowIdx);
+      ok++;
+    } catch (e) {
+      ctx.sheet.getRange(p.rowIdx, ctx.col.status + 1)
+        .setValue('FAILED: ' + e.message + ' (' + nowStamp_() + ')');
+      fail++;
+    }
+  });
+
+  SpreadsheetApp.getActiveSpreadsheet().toast('Done. Success: ' + ok + ' | Failed: ' + fail, 'Merge Creator', 10);
+}
+
+function forceRegenerateSelectedRow() {
+  const ui = SpreadsheetApp.getUi();
+  const ctx = buildContext_();
+  const rowIdx = ctx.sheet.getActiveCell().getRow();
+  if (rowIdx <= ctx.cfg.HEADER_ROW) { ui.alert('Select a cell in a data row first (not the header).'); return; }
+
+  const r = rowIdx - ctx.cfg.HEADER_ROW - 1;
+  if (r < 0 || r >= ctx.data.length) { ui.alert('This row has no data.'); return; }
+
+  const name = getDisplayName_(ctx, r);
+  const confirm = ui.alert(
+    'Confirm re-generate',
+    'A document will be (re)generated for:\n\n' + name + ' (row ' + rowIdx + ')\n\nProceed?',
+    ui.ButtonSet.YES_NO);
+  if (confirm !== ui.Button.YES) return;
+
+  try {
+    mergeRow_(ctx, r, rowIdx);
+    SpreadsheetApp.getActiveSpreadsheet().toast('Document for ' + name + ' generated.', 'Merge Creator', 5);
+  } catch (e) {
+    ctx.sheet.getRange(rowIdx, ctx.col.status + 1)
+      .setValue('FAILED: ' + e.message + ' (' + nowStamp_() + ')');
+    ui.alert('Failed: ' + e.message);
+  }
+}
+
+
+// ─────────────────── AUTO-TRIGGER (OPTIONAL) ───────────────────
+function installOnEditTrigger() {
+  uninstallOnEditTrigger();
+  ScriptApp.newTrigger('handleEdit_')
+    .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
+    .onEdit()
+    .create();
+  SpreadsheetApp.getActiveSpreadsheet().toast('Auto-trigger installed. Set the trigger column to YES → confirmation → merge.', 'Merge Creator', 8);
+}
+
+function uninstallOnEditTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'handleEdit_')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+function handleEdit_(e) {
+  try {
+    if (!e || !e.range) return;
+    const cfg = getConfig_();
+    const sheet = e.range.getSheet();
+    if (sheet.getName() !== cfg.SHEET_NAME) return;
+
+    const ctx = buildContext_();
+    if (e.range.getColumn() - 1 !== ctx.col.trigger) return;
+
+    const rowIdx = e.range.getRow();
+    if (rowIdx <= ctx.cfg.HEADER_ROW) return;
+
+    const val = String(e.value || '').trim().toUpperCase();
+    if (val !== 'YES') return;
+
+    const r = rowIdx - ctx.cfg.HEADER_ROW - 1;
+    const status = String(ctx.data[r][ctx.col.status] || '').trim();
+    if (status.startsWith('Document successfully')) return;
+
+    // ★ Confirmation here too, for consistency
+    const name = getDisplayName_(ctx, r);
+    const ui = SpreadsheetApp.getUi();
+    const confirm = ui.alert(
+      'Confirm — 1 document will be created',
+      'A document will be generated for:\n\n' + name + ' (row ' + rowIdx + ')\n\nProceed?',
+      ui.ButtonSet.YES_NO);
+    if (confirm !== ui.Button.YES) return;
+
+    mergeRow_(ctx, r, rowIdx);
+    SpreadsheetApp.getActiveSpreadsheet().toast('Document for ' + name + ' created.', 'Merge Creator', 5);
+  } catch (err) {
+    console.error('handleEdit_ error: ' + err.message);
+  }
+}
+
+
+// ─────────────────────── CORE MERGE ───────────────────────
+function mergeRow_(ctx, r, rowIdx) {
+  const cfg = ctx.cfg;
+  if (!cfg.TEMPLATE_DOC_ID) throw new Error('Template not set. Run ⚙️ Setup → Set template Doc.');
+
+  const rowVals = ctx.data[r];
+  const resolve = makeResolver_(ctx.headers, rowVals, cfg.ALIASES);
+
+  const fileName = replacePlaceholdersInString_(cfg.FILE_NAME_PATTERN, resolve)
+    .replace(/[\/\\:*?"<>|]/g, '-');
+
+  const templateFile = DriveApp.getFileById(cfg.TEMPLATE_DOC_ID);
+  const folder = cfg.OUTPUT_FOLDER_ID
+    ? DriveApp.getFolderById(cfg.OUTPUT_FOLDER_ID)
+    : (templateFile.getParents().hasNext() ? templateFile.getParents().next() : DriveApp.getRootFolder());
+
+  // 1. Copy template → merged GOOGLE DOC
+  const docCopy = templateFile.makeCopy(fileName, folder);
+  const doc = DocumentApp.openById(docCopy.getId());
+
+  // 2. Replace every <<...>> in body, header, footer
+  const sections = [doc.getBody(), doc.getHeader(), doc.getFooter()].filter(Boolean);
+  const unresolved = [];
+  sections.forEach(section => {
+    extractTags_(section.getText()).forEach(tag => {
+      const val = resolve(tag);
+      if (val === null) unresolved.push(tag);
+      section.replaceText(escapeRegex_('<<' + tag + '>>'), val === null ? '' : escapeReplacement_(val));
+    });
+  });
+  doc.saveAndClose();
+
+  // 3. Export PDF
+  const pdfBlob = DriveApp.getFileById(docCopy.getId()).getAs('application/pdf').setName(fileName + '.pdf');
+  const pdfFile = folder.createFile(pdfBlob);
+
+  // 4. Write results back:
+  //    ID column = PDF ID | URL column = PDF URL | Link column = hyperlink to Google Doc | Status
+  const status = 'Document successfully created ' + nowStamp_() +
+    (unresolved.length ? ' | Unresolved tags: ' + unresolved.join(', ') : '');
+
+  ctx.sheet.getRange(rowIdx, ctx.col.docId  + 1).setValue(pdfFile.getId());
+  ctx.sheet.getRange(rowIdx, ctx.col.docUrl + 1).setValue(pdfFile.getUrl());
+  ctx.sheet.getRange(rowIdx, ctx.col.link   + 1)
+    .setFormula('=HYPERLINK("' + docCopy.getUrl() + '","' + fileName.replace(/"/g, '""') + '")');
+  ctx.sheet.getRange(rowIdx, ctx.col.status + 1).setValue(status);
+}
+
+
+// ───────────────── PLACEHOLDER RESOLUTION ─────────────────
+function makeResolver_(headers, rowVals, aliases) {
+  const normHeaders = headers.map(h => norm_(h));
+  const normAliases = {};
+  Object.keys(aliases || {}).forEach(k => { normAliases[norm_(k)] = aliases[k]; });
+
+  return function resolve(tag) {
+    let key = norm_(tag);
+    if (normAliases[key]) key = norm_(normAliases[key]);
+
+    let i = normHeaders.indexOf(key);
+    if (i !== -1) return String(rowVals[i]);
+
+    i = normHeaders.findIndex(h => h.startsWith(key));
+    if (i !== -1) return String(rowVals[i]);
+
+    i = normHeaders.findIndex(h => key.startsWith(h) || h.includes(key));
+    if (i !== -1) return String(rowVals[i]);
+
+    return null;
+  };
+}
+
+function replacePlaceholdersInString_(str, resolve) {
+  return str.replace(/<<([^>]+)>>/g, (m, tag) => {
+    const v = resolve(tag.trim());
+    return v === null ? '' : v;
+  });
+}
+
+function extractTags_(text) {
+  const tags = new Set();
+  const re = /<<([^>]+)>>/g;
+  let m;
+  while ((m = re.exec(text)) !== null) tags.add(m[1].trim());
+  return [...tags];
+}
+
+
+// ───────────────────── HELPERS ─────────────────────
+function buildContext_() {
+  const cfg = getConfig_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(cfg.SHEET_NAME);
+  if (!sheet) throw new Error('Sheet "' + cfg.SHEET_NAME + '" not found. Run ⚙️ Setup → Set sheet name.');
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(cfg.HEADER_ROW, 1, 1, lastCol).getDisplayValues()[0];
+  const data = lastRow > cfg.HEADER_ROW
+    ? sheet.getRange(cfg.HEADER_ROW + 1, 1, lastRow - cfg.HEADER_ROW, lastCol).getDisplayValues()
+    : [];
+
+  const findCol = (name) => {
+    const key = norm_(name);
+    let i = headers.findIndex(h => norm_(h) === key);
+    if (i === -1) i = headers.findIndex(h => norm_(h).startsWith(key));
+    if (i === -1) throw new Error('Column "' + name + '" not found in headers. Run ⚙️ Setup → Set column headers.');
+    return i; // 0-based
+  };
+
+  return {
+    cfg, sheet, headers, data,
+    col: {
+      trigger: findCol(cfg.COL_TRIGGER),
+      docId:   findCol(cfg.COL_DOC_ID),
+      docUrl:  findCol(cfg.COL_DOC_URL),
+      link:    findCol(cfg.COL_LINK),
+      status:  findCol(cfg.COL_STATUS),
+    },
+  };
+}
+
+function getDisplayName_(ctx, r) {
+  const key = norm_(ctx.cfg.COL_NAME);
+  const i = ctx.headers.findIndex(h => norm_(h) === key || norm_(h).startsWith(key));
+  const name = i !== -1 ? String(ctx.data[r][i] || '').trim() : '';
+  return name || '(name empty — row ' + (ctx.cfg.HEADER_ROW + 1 + r) + ')';
+}
+
+function norm_(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function escapeRegex_(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeReplacement_(s) {
+  return String(s).replace(/\$/g, '\\$');
+}
+
+function nowStamp_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss');
+}
